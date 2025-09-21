@@ -1,0 +1,283 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from supabase import create_client
+import time
+from datetime import datetime, timedelta
+
+# Page configuration - Clean, minimalist dashboard
+st.set_page_config(
+    page_title="DHT Sensor Dashboard",
+    layout="wide",
+    initial_sidebar_state="expanded"  # Show the sidebar by default for current readings
+)
+
+# Constants
+SUPABASE_URL = "https://mbepifsbetntbnqeajmf.supabase.co"
+SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im1iZXBpZnNiZXRudGJucWVham1mIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDQ3MzUyOTksImV4cCI6MjA2MDMxMTI5OX0.e4HeZXp5tKcK1Qic7nVIOQ5x_ZeSBi9U1i6VPM44d5c"
+DEVICE_ID = "esp32_dht_sensor"
+TABLE_NAME = "DHT-DATA"  # New table name
+REFRESH_INTERVAL = 0  # Seconds between data refreshes
+IST_OFFSET = pd.Timedelta(hours=5, minutes=30)  # Indian Standard Time UTC+5:30
+
+# Initialize Supabase client (cached to prevent reconnecting)
+@st.cache_resource
+def init_supabase():
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Function to fetch sensor data from Supabase
+def fetch_sensor_data():
+    try:
+        # Calculate time 24 hours ago in UTC
+        time_24h_ago = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+        
+        # Show diagnostic information
+        with st.sidebar.expander("Connection Diagnostics"):
+            st.write(f"Table name: `{TABLE_NAME}`")
+            st.write(f"Device ID: `{DEVICE_ID}`")
+            st.write(f"Looking for data since: {time_24h_ago}")
+            
+            # Test connection by getting table info
+            try:
+                # First check if we can connect at all
+                test_response = supabase.table("DHT-DATA").select("count(*)", count="exact").execute()
+                st.success("✓ Connected to Supabase")
+                st.write(f"Total rows in table: {test_response.count if hasattr(test_response, 'count') else 'Unknown'}")
+            except Exception as conn_err:
+                st.error(f"✗ Supabase connection error: {str(conn_err)}")
+        
+        # Fetch data from Supabase
+        response = supabase.table(TABLE_NAME) \
+            .select("*") \
+            .eq("device_id", DEVICE_ID) \
+            .gte("created_at", time_24h_ago) \
+            .order("created_at", desc=False) \
+            .execute()
+        
+        if not response.data:
+            # Show message in diagnostics
+            with st.sidebar.expander("No Data Found", expanded=True):
+                st.warning("No data found matching the criteria")
+                st.write("Possible causes:")
+                st.write("1. ESP32 is not sending data")
+                st.write("2. Table name mismatch ('DHT-DATA')")
+                st.write("3. Device ID mismatch ('esp32_dht_sensor')")
+            return pd.DataFrame()
+            
+        # Process the data
+        df = pd.DataFrame(response.data)
+        
+        # Show sample data in diagnostics
+        with st.sidebar.expander("Raw Data Sample"):
+            # Show the timestamps in both UTC and IST formats
+            df_display = df.copy()
+            if 'created_at' in df_display.columns:
+                df_display['created_at_utc'] = pd.to_datetime(df_display['created_at']).dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+                # Calculate IST time (UTC+5:30)
+                ist_times = pd.to_datetime(df_display['created_at']) + pd.Timedelta(hours=5, minutes=30)
+                df_display['created_at_ist'] = ist_times.dt.strftime('%Y-%m-%d %H:%M:%S IST')
+            st.write(df_display.head(3))
+            
+            st.info("⚠️ Note: The year may show as 2025 because of Replit's system clock, but the time conversion to IST (+5:30) should be correct.")
+        
+        # Convert timestamp to datetime and add IST time
+        df['created_at'] = pd.to_datetime(df['created_at'])
+        df['ist_time'] = df['created_at'] + IST_OFFSET
+        
+        # Add formatted time columns for display with clearer labels
+        df['ist_time_str'] = df['ist_time'].dt.strftime('%H:%M:%S')
+        df['ist_date_str'] = df['ist_time'].dt.strftime('%Y-%m-%d')
+        
+        return df
+            
+    except Exception as e:
+        st.error(f"Error fetching data: {str(e)}")
+        with st.sidebar.expander("Error Details", expanded=True):
+            st.error(f"Detailed error: {str(e)}")
+            st.write("Check that:")
+            st.write("1. Supabase URL and key are correct")
+            st.write("2. The table 'DHT-DATA' exists")
+            st.write("3. The table has the expected columns")
+        return pd.DataFrame()
+
+# Create temperature chart with IST time
+def create_temperature_chart(df):
+    if df.empty:
+        return None
+    
+    fig = px.line(
+        df, 
+        x='ist_time', 
+        y='temperature',
+        labels={'ist_time': 'Time (IST)', 'temperature': 'Temperature (°C)'},
+        title='Temperature over Time',
+        hover_data={'ist_time_str': True, 'ist_date_str': True}
+    )
+    
+    # Format x-axis to show time in a readable format
+    fig.update_xaxes(
+        tickformat="%H:%M",
+        tickmode='auto',
+        nticks=12,
+        title=None
+    )
+    
+    # Better hover template
+    fig.update_traces(
+        hovertemplate='<b>Date</b>: %{customdata[1]}<br><b>Time</b>: %{customdata[0]}<br><b>Temperature</b>: %{y:.1f}°C<extra></extra>'
+    )
+    
+    # Clean layout
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=40, b=20),
+        height=350,
+        title_x=0.5,
+        plot_bgcolor='rgba(240,240,240,0.2)',  # Light background
+        paper_bgcolor='rgba(0,0,0,0)',  # Transparent
+        font=dict(size=12)
+    )
+    
+    return fig
+
+# Create humidity chart with IST time
+def create_humidity_chart(df):
+    if df.empty:
+        return None
+    
+    fig = px.line(
+        df, 
+        x='ist_time', 
+        y='humidity',
+        labels={'ist_time': 'Time (IST)', 'humidity': 'Humidity (%)'},
+        title='Humidity over Time',
+        hover_data={'ist_time_str': True, 'ist_date_str': True}
+    )
+    
+    # Format x-axis to show time in a readable format
+    fig.update_xaxes(
+        tickformat="%H:%M",
+        tickmode='auto',
+        nticks=12,
+        title=None
+    )
+    
+    # Better hover template
+    fig.update_traces(
+        hovertemplate='<b>Date</b>: %{customdata[1]}<br><b>Time</b>: %{customdata[0]}<br><b>Humidity</b>: %{y:.1f}%<extra></extra>'
+    )
+    
+    # Clean layout
+    fig.update_layout(
+        margin=dict(l=20, r=20, t=40, b=20),
+        height=350,
+        title_x=0.5,
+        plot_bgcolor='rgba(240,240,240,0.2)',  # Light background
+        paper_bgcolor='rgba(0,0,0,0)',  # Transparent
+        font=dict(size=12)
+    )
+    
+    return fig
+
+# Function to display current readings in the sidebar
+def display_current_readings(df):
+    if df.empty:
+        st.sidebar.warning("No current readings available")
+        return
+        
+    # Get the most recent reading
+    latest = df.iloc[-1]
+    
+    # Add a heading
+    st.sidebar.markdown("### Current Readings")
+    
+    # Display the temperature with a metric widget
+    st.sidebar.metric(
+        "Temperature", 
+        f"{latest['temperature']:.1f} °C",
+        delta=None
+    )
+    
+    # Display the humidity with a metric widget
+    st.sidebar.metric(
+        "Humidity", 
+        f"{latest['humidity']:.1f} %",
+        delta=None
+    )
+    
+    # Calculate the original UTC timestamp and the IST version
+    utc_time = latest['created_at'].strftime('%H:%M:%S')
+    
+    # Show when the reading was taken with both times for clarity
+    st.sidebar.markdown("**Last Reading Time:**")
+    st.sidebar.markdown(f"🕒 **IST (Your Time)**: {latest['ist_time_str']}")
+    st.sidebar.markdown(f"🌐 **UTC**: {utc_time}")
+    
+    # Add note about time conversion
+    st.sidebar.caption("Note: The dashboard shows IST time (UTC+5:30)")
+    
+    # Show time difference calculation for reference
+    with st.sidebar.expander("Time Conversion Details"):
+        st.write("Your timezone is UTC+5:30 (Indian Standard Time)")
+        st.write(f"Raw timestamp from database: {latest['created_at']}")
+        st.write(f"Converted to IST: {latest['ist_time']}")
+        st.write("The time conversion is: UTC time + 5 hours and 30 minutes = IST time")
+
+# Initialize Supabase client
+supabase = init_supabase()
+
+# App layout
+st.title("DHT Sensor Dashboard")
+st.caption("Real-time temperature and humidity monitoring")
+
+# Create placeholders for dynamic content
+status_placeholder = st.empty()
+time_explanation = st.empty()
+temp_chart_placeholder = st.empty()
+humidity_chart_placeholder = st.empty()
+
+# Auto-refresh data and update charts
+while True:
+    # Display last updated time in both UTC and IST
+    current_time_utc = datetime.utcnow()
+    current_time_ist = current_time_utc + IST_OFFSET
+    
+    # Show both times for clarity
+    status_placeholder.markdown(f"""
+    **Dashboard Last Updated:**
+    - 🕒 **IST (Indian Time)**: {current_time_ist.strftime('%H:%M:%S')}
+    - 🌐 **UTC**: {current_time_utc.strftime('%H:%M:%S')}
+    """)
+    
+    # Add explanation about the time conversion for debugging
+    time_explanation.info("""
+    **About Time Display:**
+    The dashboard shows both UTC and Indian Standard Time (IST = UTC+5:30).
+    The year may show as 2025 due to Replit's system clock, but the time conversion is correct.
+    """)
+    
+    # Fetch latest data
+    df = fetch_sensor_data()
+    
+    if df.empty:
+        # Display messages when no data is available
+        temp_chart_placeholder.info("No temperature data available in the last 24 hours")
+        humidity_chart_placeholder.info("No humidity data available in the last 24 hours")
+        st.sidebar.warning("No sensor data available")
+    else:
+        # Display current readings in the sidebar
+        display_current_readings(df)
+        
+        # Create and display charts
+        temp_fig = create_temperature_chart(df)
+        humidity_fig = create_humidity_chart(df)
+        
+        temp_chart_placeholder.plotly_chart(temp_fig, use_container_width=True)
+        humidity_chart_placeholder.plotly_chart(humidity_fig, use_container_width=True)
+        
+        # Display data statistics
+        with st.expander("Data Statistics"):
+            st.dataframe(df[['ist_time_str', 'temperature', 'humidity']].describe())
+    
+    # Wait before refreshing
+    time.sleep(REFRESH_INTERVAL)
+    st.rerun()
